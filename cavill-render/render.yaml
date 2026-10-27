@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: cavill-render
+    env: node
+    buildCommand: npm install; npm run build
+    startCommand: npm run start
+    plan: free
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        value: cavill-render-2026

@@ -1,0 +1,94 @@
+// Tela Literária — schema (modelo de árvore, estilo DeepSeek/ChatGPT)
+//
+// Principais invariantes:
+// - Edições NUNCA sobrescrevem. Criam um novo nó irmão (mesmo parentMessageId).
+// - Toda mensagem tem um parentMessageId (exceto a primeira da conversa, que é null).
+// - Cada Conversation tem um "activeLeafId" — o nó atualmente visível no fim da thread.
+// - Para alternar entre versões, mudamos o "activeLeafId" — não criamos nem apagamos nada.
+// - BackupEntry mantém snapshot Markdown a cada mutação.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  passwordHash  String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  conversations  Conversation[]
+  sessions       Session[]
+}
+
+model Session {
+  id            String   @id @default(cuid())
+  sessionToken  String   @unique
+  userId        String
+  expires       DateTime
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Conversation {
+  id           String   @id @default(cuid())
+  title        String   @default("Nova conversa")
+  userId       String
+  // Nó folha ativo da conversa. A thread visível é sempre o caminho da raiz até este nó.
+  // Quando o usuário edita uma mensagem, criamos um novo nó irmão e mudamos o activeLeafId.
+  // Quando o usuário alterna entre versões, mudamos só o activeLeafId.
+  activeLeafId String?
+  lastActiveAt DateTime @default(now())
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user     User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([userId])
+  @@index([lastActiveAt])
+}
+
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  role           String   // "user" | "assistant" | "system"
+  content        String   // conteúdo direto da mensagem (não há mais versões separadas)
+  // pai na árvore. null = primeira mensagem da conversa (raiz).
+  parentMessageId String?
+  // generation: "user" = veio do usuário; "regen" = resposta da IA; "edit" = criação de edição;
+  // usado para UX (saber se o nó é "editável")
+  generation     String   @default("user")
+  // se true, é um "túmulo" de mensagem apagada (soft delete) — fica no banco mas some do chat
+  isDeleted      Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  parent       Message?      @relation("MessageTree", fields: [parentMessageId], references: [id], onDelete: NoAction)
+  children     Message[]     @relation("MessageTree")
+
+  @@index([conversationId])
+  @@index([parentMessageId])
+}
+
+model BackupEntry {
+  id             String   @id @default(cuid())
+  userId         String
+  conversationId String?
+  action         String   // "send" | "edit" | "delete" | "switch" | "rename"
+  markdown       String
+  createdAt      DateTime @default(now())
+
+  @@index([userId])
+  @@index([conversationId])
+  @@index([createdAt])
+}

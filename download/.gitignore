@@ -1,0 +1,62 @@
+# Dependências
+node_modules/
+.pnp
+.pnp.js
+
+# Build
+.next/
+out/
+build/
+dist/
+
+# Ambiente
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dev.log
+server.log
+
+# Banco local (SQLite — caso use localmente)
+*.db
+*.db-journal
+db/
+
+# Cache
+.cache/
+.turbo/
+.vercel/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Arquivos do sandbox (não devem ir pra produção)
+.zscripts/
+skills/
+skills-lock.json
+scripts/migration-backup.json
+scripts/mobile-test.png
+scripts/mobile-sidebar-open.png
+upload/
+worklog.md
+neon.ts
+.neon
+examples/
+tests/
+mini-services/
+Caddyfile

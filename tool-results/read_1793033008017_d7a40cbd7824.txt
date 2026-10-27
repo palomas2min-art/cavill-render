@@ -1,0 +1,711 @@
+     1→import { db } from './db'
+     2→import { saveBackup } from './backup'
+     3→import { generateAssistantReply } from './ai'
+     4→import ZAI from 'z-ai-web-dev-sdk'
+     5→import { randomUUID } from 'crypto'
+     6→
+     7→/**
+     8→ * Modelo de árvore — estilo DeepSeek/ChatGPT.
+     9→ *
+    10→ * INVARIANTES:
+    11→ * - Cada mensagem tem um parentMessageId (null se for a primeira da conversa).
+    12→ * - Edições NUNCA sobrescrevem. Criam um novo nó irmão (mesmo parentMessageId).
+    13→ * - Cada conversa tem um activeLeafId — o nó visível no fim da thread ativa.
+    14→ * - A thread visível é sempre o caminho da raiz até o activeLeafId.
+    15→ * - Alternar entre versões = mudar o activeLeafId (não cria nem apaga nada).
+    16→ * - Apagar mensagem = soft delete (isDeleted=true); permanece na árvore.
+    17→ */
+    18→
+    19→/**
+    20→ * Retorna a thread ativa = caminho da raiz até o activeLeafId da conversa.
+    21→ * Em ordem cronológica (raiz primeiro).
+    22→ */
+    23→export async function getActiveThread(conversationId: string) {
+    24→  const conv = await db.conversation.findUnique({ where: { id: conversationId } })
+    25→  if (!conv) throw new Error('CONVERSATION_NOT_FOUND')
+    26→  if (!conv.activeLeafId) return []
+    27→
+    28→  const allMessages = await db.message.findMany({
+    29→    where: { conversationId },
+    30→    orderBy: { createdAt: 'asc' },
+    31→  })
+    32→  const byId = new Map(allMessages.map((m) => [m.id, m]))
+    33→
+    34→  const thread: typeof allMessages = []
+    35→  let cur = byId.get(conv.activeLeafId)
+    36→  while (cur) {
+    37→    thread.unshift(cur)
+    38→    cur = cur.parentMessageId ? byId.get(cur.parentMessageId) : undefined
+    39→  }
+    40→  return thread
+    41→}
+    42→
+    43→/**
+    44→ * Constrói o histórico para enviar à IA, com sistema de MEMÓRIA INTELIGENTE:
+    45→ *
+    46→ * 1. Pega a thread ativa completa.
+    47→ * 2. Se a thread tiver mais que MAX_RECENT_MESSAGES mensagens:
+    48→ *    - As mensagens antigas (antes das últimas MAX_RECENT_MESSAGES) viram um RESUMO
+    49→ *    - O resumo é gerado pela própria IA UMA VEZ e cached no banco (tabela ConversationSummary)
+    50→ *    - O resumo é regerado quando novas mensagens são adicionadas e o resumo atual
+    51→ *      cobre menos que 80% das mensagens antigas.
+    52→ * 3. Envia pra IA: [resumo (se houver)] + [últimas MAX_RECENT_MESSAGES mensagens completas]
+    53→ *
+    54→ * Isso resolve o problema de memória: a IA lembra dos personagens e eventos antigos
+    55→ * (via resumo) sem consumir tokens demais (só lê últimas mensagens completas).
+    56→ */
+    57→const MAX_RECENT_MESSAGES = 50 // últimas mensagens enviadas completas (Nemotron tem 1M contexto)
+    58→const MAX_CHARS_PER_MESSAGE = 10000 // truncar mensagens muito longas
+    59→const MAX_SUMMARY_LENGTH = 2500 // limite do resumo
+    60→
+    61→async function buildHistoryForAI(
+    62→  conversationId: string,
+    63→  beforeMessageId?: string
+    64→): Promise<{ role: 'user' | 'assistant'; content: string }[]> {
+    65→  const thread = await getActiveThread(conversationId)
+    66→  const fullHistory: { role: 'user' | 'assistant'; content: string }[] = []
+    67→  for (const m of thread) {
+    68→    if (beforeMessageId && m.id === beforeMessageId) break
+    69→    if (m.isDeleted) continue
+    70→    if (m.role === 'system') continue
+    71→    let content = m.content
+    72→    if (content.length > MAX_CHARS_PER_MESSAGE) {
+    73→      content = content.substring(0, MAX_CHARS_PER_MESSAGE) + ' [...]'
+    74→    }
+    75→    fullHistory.push({ role: m.role as 'user' | 'assistant', content })
+    76→  }
+    77→
+    78→  // Busca resumo fixo (definido manualmente pelo usuário, nunca regerado)
+    79→  const fixedSummary = await db.conversationFixedSummary.findUnique({
+    80→    where: { conversationId },
+    81→  })
+    82→
+    83→  // Se tem poucas mensagens e não tem resumo fixo, manda tudo
+    84→  if (fullHistory.length <= MAX_RECENT_MESSAGES && !fixedSummary) {
+    85→    return fullHistory
+    86→  }
+    87→
+    88→  // Tem mais mensagens que o limite ou tem resumo fixo — monta histórico completo
+    89→  const recentMessages = fullHistory.slice(-MAX_RECENT_MESSAGES)
+    90→  const oldMessages = fullHistory.length > MAX_RECENT_MESSAGES
+    91→    ? fullHistory.slice(0, -MAX_RECENT_MESSAGES)
+    92→    : []
+    93→
+    94→  // Tenta buscar resumo dinâmico existente (só se tiver mensagens antigas)
+    95→  let dynamicSummary: string | null = null
+    96→  if (oldMessages.length > 0) {
+    97→    dynamicSummary = await getOrCreateSummary(conversationId, oldMessages)
+    98→  }
+    99→
+   100→  // Monta histórico final:
+   101→  // 1. [resumo fixo] (se existir) — definido pelo usuário, NUNCA muda, é o cânone absoluto
+   102→  // 2. [resumo dinâmico] (se existir) — gerado automaticamente
+   103→  // 3. [últimas mensagens recentes]
+   104→  const history: { role: 'user' | 'assistant'; content: string }[] = []
+   105→
+   106→  if (fixedSummary && fixedSummary.content.trim()) {
+   107→    history.push({
+   108→      role: 'user',
+   109→      content: '[RESUMO FIXO DA HISTÓRIA — definido pela criadora. Use como base absoluta, NUNCA contradiga, é o cânone definitivo]:\n' + fixedSummary.content,
+   110→    })
+   111→    history.push({
+   112→      role: 'assistant',
+   113→      content: 'Entendido. Tenho o resumo fixo da história em mente como cânone absoluto. Pode continuar.',
+   114→    })
+   115→  }
+   116→
+   117→  // Só usa resumo dinâmico se NÃO tem resumo fixo (evita conflito de informações)
+   118→  // O resumo fixo é o cânone definitivo escrito pela criadora — não precisa de outro resumo
+   119→  if (dynamicSummary && !fixedSummary) {
+   120→    history.push({
+   121→      role: 'user',
+   122→      content: '[RESUMO DINÂMICO DA HISTÓRIA ATÉ AQUI — use como complemento ao resumo fixo]:\n' + dynamicSummary + '\n\n---\n[A partir daqui, mensagens recentes:]',
+   123→    })
+   124→    history.push({
+   125→      role: 'assistant',
+   126→      content: 'Entendido. Tenho o contexto completo. Pode continuar.',
+   127→    })
+   128→  }
+   129→
+   130→  // Busca capítulos relevantes (RAG) com base na última mensagem do usuário
+   131→  // Pega a última mensagem do usuário nas recentMessages pra usar como query
+   132→  const lastUserMsg = [...recentMessages].reverse().find((m) => m.role === 'user')
+   133→  if (lastUserMsg) {
+   134→    const relevantChapters = await getRelevantChapters(conversationId, lastUserMsg.content)
+   135→    if (relevantChapters.length > 0) {
+   136→      const chaptersText = relevantChapters
+   137→        .map((c, i) => `[CAPÍTULO ${i + 1}: ${c.title}]\n${c.content}`)
+   138→        .join('\n\n---\n\n')
+   139→      history.unshift({
+   140→        role: 'user',
+   141→        content: '[CAPÍTULOS RELEVANTES DA HISTÓRIA — leia e use como contexto absoluto, é o cânone]:\n\n' + chaptersText,
+   142→      })
+   143→      history.unshift({
+   144→        role: 'assistant',
+   145→        content: 'Entendido. Tenho os capítulos relevantes em mente como cânone absoluto. Pode continuar.',
+   146→      })
+   147→    }
+   148→  }
+   149→
+   150→  history.push(...recentMessages)
+   151→  return history
+   152→}
+   153→
+   154→/**
+   155→ * Busca os capítulos mais relevantes pra uma mensagem do usuário.
+   156→ * Usa um algoritmo simples de similaridade por palavras-chave + contagem de palavras.
+   157→ * Retorna os top N capítulos mais relevantes (default 5).
+   158→ *
+   159→ * Como funciona:
+   160→ * 1. Pega a mensagem do usuário e extrai as palavras importantes (ignora stopwords)
+   161→ * 2. Pra cada capítulo, conta quantas dessas palavras aparecem no conteúdo + keywords
+   162→ * 3. Retorna os capítulos com maior pontuação
+   163→ */
+   164→async function getRelevantChapters(
+   165→  conversationId: string,
+   166→  userMessage: string,
+   167→  maxChapters: number = 5
+   168→): Promise<{ id: string; title: string; content: string; keywords: string }[]> {
+   169→  const chapters = await db.chapter.findMany({
+   170→    where: { conversationId },
+   171→    orderBy: { order: 'asc' },
+   172→  })
+   173→
+   174→  // Retorna TODOS os capítulos — a criadora quer que a IA lembre de tudo
+   175→  // O Nemotron tem 1 milhão de tokens de contexto, cabe tudo
+   176→  return chapters
+   177→}
+   178→
+   179→/**
+   180→ * Busca resumo existente da conversa ou cria um novo.
+   181→ * O resumo é cached no banco (ConversationSummary) e regerado quando novas mensagens
+   182→ * antigas aparecem (ou seja, quando o resumo atual não cobre todas as mensagens antigas).
+   183→ */
+   184→async function getOrCreateSummary(
+   185→  conversationId: string,
+   186→  oldMessages: { role: 'user' | 'assistant'; content: string }[]
+   187→): Promise<string | null> {
+   188→  if (oldMessages.length === 0) return null
+   189→
+   190→  // Busca resumo existente
+   191→  const existing = await db.conversationSummary.findUnique({
+   192→    where: { conversationId },
+   193→  })
+   194→
+   195→  // Conta quantas mensagens antigas existem
+   196→  const oldMessagesCount = oldMessages.length
+   197→
+   198→  // Se tem resumo e ele cobre pelo menos 80% das mensagens antigas, usa ele
+   199→  if (existing && existing.coveredMessagesCount >= Math.floor(oldMessagesCount * 0.8)) {
+   200→    return existing.summary
+   201→  }
+   202→
+   203→  // Precisa gerar (ou regerar) o resumo
+   204→  // Pega o resumo anterior + novas mensagens antigas pra incluir no resumo novo
+   205→  const previousSummary = existing?.summary || ''
+   206→  const newMessagesToSummarize = existing
+   207→    ? oldMessages.slice(existing.coveredMessagesCount)
+   208→    : oldMessages
+   209→
+   210→  if (newMessagesToSummarize.length === 0 && previousSummary) {
+   211→    return previousSummary
+   212→  }
+   213→
+   214→  // Gera resumo novo
+   215→  const newSummary = await generateConversationSummary(
+   216→    previousSummary,
+   217→    newMessagesToSummarize
+   218→  )
+   219→
+   220→  if (!newSummary) return previousSummary
+   221→
+   222→  // Salva/atualiza no banco
+   223→  await db.conversationSummary.upsert({
+   224→    where: { conversationId },
+   225→    create: {
+   226→      conversationId,
+   227→      summary: newSummary,
+   228→      coveredMessagesCount: oldMessagesCount,
+   229→    },
+   230→    update: {
+   231→      summary: newSummary,
+   232→      coveredMessagesCount: oldMessagesCount,
+   233→      updatedAt: new Date(),
+   234→    },
+   235→  })
+   236→
+   237→  return newSummary
+   238→}
+   239→
+   240→/**
+   241→ * Pede pra IA gerar um resumo da história.
+   242→ * Inclui o resumo anterior (se houver) + novas mensagens a serem resumidas.
+   243→ */
+   244→async function generateConversationSummary(
+   245→  previousSummary: string,
+   246→  newMessages: { role: 'user' | 'assistant'; content: string }[]
+   247→): Promise<string | null> {
+   248→  // Constrói as mensagens pra IA resumir
+   249→  const messages = []
+   250→
+   251→  const systemPrompt = `Você é uma assistente que resume histórias de ficção. Sua tarefa é manter um resumo atualizado da história, preservando TODOS os elementos importantes:
+   252→
+   253→- Personagens (nome, idade, aparência, personalidade, motivação)
+   254→- Relações entre personagens (quem ama quem, quem é inimigo de quem, quem traiu quem)
+   255→- Eventos importantes (o que aconteceu, em ordem)
+   256→- Cenários (onde aconteceu, onde os personagens estão agora)
+   257→- Arcos de personagem (mudanças importantes)
+   258→- Temas (romance proibido, conflito moral, etc)
+   259→- Detalhes sensoriais importantes (cheiros, objetos, marcas)
+   260→- Frases ou falas marcantes que podem ser referenciadas depois
+   261→
+   262→REGRAS:
+   263→- Seja CONCISO mas COMPLETO. Não perca informações importantes.
+   264→- Use marcadores (•) pra organizar.
+   265→- Máximo ${MAX_SUMMARY_LENGTH} caracteres.
+   266→- Escreva em português.
+   267→- Se já existe um resumo anterior, integre as novas informações nele.
+   268→- NUNCA invente informações que não estão nas mensagens.`
+   269→
+   270→  messages.push({ role: 'system', content: systemPrompt })
+   271→
+   272→  let userContent = ''
+   273→  if (previousSummary) {
+   274→    userContent += 'RESUMO ATUAL DA HISTÓRIA (atualize com as novas mensagens abaixo):\n\n' + previousSummary + '\n\n---\nNOVAS MENSAGENS PARA INTEGRAR AO RESUMO:\n\n'
+   275→  } else {
+   276→    userContent += 'MENSAGENS DA CONVERSA PARA RESUMIR:\n\n'
+   277→  }
+   278→
+   279→  for (const m of newMessages) {
+   280→    const role = m.role === 'user' ? 'USUÁRIO' : 'LIV'
+   281→    // Trunca cada mensagem pra não estourar contexto
+   282→    const truncated = m.content.length > 2000
+   283→      ? m.content.substring(0, 2000) + ' [...]'
+   284→      : m.content
+   285→    userContent += `[${role}]: ${truncated}
+   286→
+   287→`
+   288→  }
+   289→
+   290→  userContent += '\nGere o resumo atualizado (máximo ' + MAX_SUMMARY_LENGTH + ' caracteres). Mantenha TODOS os elementos importantes do resumo anterior (se houver) e adicione os novos.'
+   291→
+   292→  messages.push({ role: 'user', content: userContent })
+   293→
+   294→  // Chama IA
+   295→  try {
+   296→    const zai = await ZAI.create()
+   297→    const completion = await zai.chat.completions.create({
+   298→      messages,
+   299→    })
+   300→    const summary = completion?.choices?.[0]?.message?.content
+   301→    if (!summary) return null
+   302→    // Trunca se passar do limite
+   303→    return summary.length > MAX_SUMMARY_LENGTH
+   304→      ? summary.substring(0, MAX_SUMMARY_LENGTH)
+   305→      : summary
+   306→  } catch (err) {
+   307→    console.error('Erro ao gerar resumo:', err)
+   308→    return null
+   309→  }
+   310→}
+   311→
+   312→/**
+   313→ * Envia mensagem do usuário:
+   314→ * 1. Cria nó user cujo pai é o activeLeafId atual (ou null se conversa vazia)
+   315→ * 2. Gera resposta da IA com o histórico até ali
+   316→ * 3. Cria nó assistant cujo pai é o nó user
+   317→ * 4. Atualiza activeLeafId para o nó assistant
+   318→ */
+   319→export async function sendUserMessage(userId: string, conversationId: string, content: string) {
+   320→  const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
+   321→  if (!conv) throw new Error('CONVERSATION_NOT_FOUND')
+   322→
+   323→  const parentId = conv.activeLeafId // pode ser null
+   324→
+   325→  // 1. Cria nó do usuário
+   326→  const userMsg = await db.message.create({
+   327→    data: {
+   328→      conversationId,
+   329→      role: 'user',
+   330→      content,
+   331→      parentMessageId: parentId,
+   332→      generation: 'user',
+   333→    },
+   334→  })
+   335→
+   336→  // 1.5 Atualiza activeLeafId para o userMsg ANTES de gerar a resposta,
+   337→  // para que buildHistoryForAI inclua a nova mensagem do usuário.
+   338→  await db.conversation.update({
+   339→    where: { id: conversationId },
+   340→    data: { activeLeafId: userMsg.id },
+   341→  })
+   342→
+   343→  // 2. Gera resposta
+   344→  const history = await buildHistoryForAI(conversationId)
+   345→  let assistantContent: string
+   346→  try {
+   347→    assistantContent = await generateAssistantReply(history)
+   348→  } catch (err) {
+   349→    const errMsg = (err as Error).message || ''
+   350→    if (errMsg.includes('429') || errMsg.toLowerCase().includes('rate limit')) {
+   351→      assistantContent = `_A Z.ai me bloqueou por rate limit (você mandou mensagens rápido demais). Espera uns 30 segundos e manda de novo, ou regenera esta resposta. Detalhe técnico: ${errMsg}_`
+   352→    } else if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503')) {
+   353→      assistantContent = `_A Z.ai deu uma tropeçada (erro de servidor). Tenta de novo em alguns segundos. Detalhe: ${errMsg}_`
+   354→    } else {
+   355→      assistantContent = `_Deu erro aqui. Tenta regenerar a resposta. Detalhe: ${errMsg}_`
+   356→    }
+   357→  }
+   358→
+   359→  // 3. Cria nó assistant (filho do userMsg)
+   360→  const assistantMsg = await db.message.create({
+   361→    data: {
+   362→      conversationId,
+   363→      role: 'assistant',
+   364→      content: assistantContent,
+   365→      parentMessageId: userMsg.id,
+   366→      generation: 'regen',
+   367→    },
+   368→  })
+   369→
+   370→  // 4. Atualiza activeLeafId
+   371→  await db.conversation.update({
+   372→    where: { id: conversationId },
+   373→    data: { activeLeafId: assistantMsg.id, lastActiveAt: new Date() },
+   374→  })
+   375→
+   376→  await saveBackup(userId, 'send', conversationId)
+   377→
+   378→  return {
+   379→    userMessage: { id: userMsg.id },
+   380→    assistantMessage: { id: assistantMsg.id, content: assistantContent },
+   381→  }
+   382→}
+   383→
+   384→/**
+   385→ * Edita uma mensagem do usuário criando um novo nó IRMÃO (mesmo parentMessageId).
+   386→ *
+   387→ * Passos:
+   388→ * 1. Acha a mensagem original. Deve ser do usuário. Não pode ser isDeleted.
+   389→ * 2. Cria novo nó user com o NOVO conteúdo, mesmo parentMessageId do original.
+   390→ * 3. Gera nova resposta da IA com histórico até o pai + o novo conteúdo.
+   391→ * 4. Cria novo nó assistant filho do novo user.
+   392→ * 5. Atualiza activeLeafId para o novo assistant.
+   393→ *
+   394→ * Importante: o nó original e seus descendentes NÃO são tocados.
+   395→ * Continuam acessíveis via alternância de ramo.
+   396→ */
+   397→export async function editMessage(
+   398→  userId: string,
+   399→  conversationId: string,
+   400→  messageId: string,
+   401→  newContent: string
+   402→) {
+   403→  const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
+   404→  if (!conv) throw new Error('CONVERSATION_NOT_FOUND')
+   405→
+   406→  const original = await db.message.findFirst({
+   407→    where: { id: messageId, conversationId },
+   408→  })
+   409→  if (!original) throw new Error('MESSAGE_NOT_FOUND')
+   410→  if (original.role !== 'user') throw new Error('ONLY_USER_MESSAGES_CAN_BE_EDITED')
+   411→  if (original.isDeleted) throw new Error('CANNOT_EDIT_DELETED_MESSAGE')
+   412→
+   413→  const parentId = original.parentMessageId // pai da original = pai do novo irmão
+   414→
+   415→  // 1. Cria novo nó user (irmão do original)
+   416→  const newUserMsg = await db.message.create({
+   417→    data: {
+   418→      conversationId,
+   419→      role: 'user',
+   420→      content: newContent,
+   421→      parentMessageId: parentId,
+   422→      generation: 'edit',
+   423→    },
+   424→  })
+   425→
+   426→  // 2. Atualiza activeLeafId temporariamente para o novo userMsg,
+   427→  // para que buildHistoryForAI use o novo ramo.
+   428→  await db.conversation.update({
+   429→    where: { id: conversationId },
+   430→    data: { activeLeafId: newUserMsg.id },
+   431→  })
+   432→
+   433→  // 3. Gera resposta
+   434→  const history = await buildHistoryForAI(conversationId)
+   435→  let assistantContent: string
+   436→  try {
+   437→    assistantContent = await generateAssistantReply(history)
+   438→  } catch (err) {
+   439→    const errMsg = (err as Error).message || ''
+   440→    if (errMsg.includes('429') || errMsg.toLowerCase().includes('rate limit')) {
+   441→      assistantContent = `_A Z.ai me bloqueou por rate limit (você mandou mensagens rápido demais). Espera uns 30 segundos e manda de novo, ou regenera esta resposta. Detalhe técnico: ${errMsg}_`
+   442→    } else if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503')) {
+   443→      assistantContent = `_A Z.ai deu uma tropeçada (erro de servidor). Tenta de novo em alguns segundos. Detalhe: ${errMsg}_`
+   444→    } else {
+   445→      assistantContent = `_Deu erro aqui. Tenta regenerar a resposta. Detalhe: ${errMsg}_`
+   446→    }
+   447→  }
+   448→
+   449→  // 4. Cria nó assistant filho do novo userMsg
+   450→  const newAssistantMsg = await db.message.create({
+   451→    data: {
+   452→      conversationId,
+   453→      role: 'assistant',
+   454→      content: assistantContent,
+   455→      parentMessageId: newUserMsg.id,
+   456→      generation: 'regen',
+   457→    },
+   458→  })
+   459→
+   460→  // 5. Atualiza activeLeafId
+   461→  await db.conversation.update({
+   462→    where: { id: conversationId },
+   463→    data: { activeLeafId: newAssistantMsg.id, lastActiveAt: new Date() },
+   464→  })
+   465→
+   466→  await saveBackup(userId, 'edit', conversationId)
+   467→
+   468→  return {
+   469→    newUserMessage: { id: newUserMsg.id },
+   470→    newAssistantMessage: { id: newAssistantMsg.id, content: assistantContent },
+   471→  }
+   472→}
+   473→
+   474→/**
+   475→ * "Apaga" uma mensagem = soft delete (isDeleted=true).
+   476→ * Não remove o nó nem seus descendentes. Só marca.
+   477→ * Se for mensagem do usuário, não regeneramos nada — o usuário só some do chat.
+   478→ */
+   479→export async function deleteMessage(userId: string, conversationId: string, messageId: string) {
+   480→  const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
+   481→  if (!conv) throw new Error('CONVERSATION_NOT_FOUND')
+   482→  const msg = await db.message.findFirst({ where: { id: messageId, conversationId } })
+   483→  if (!msg) throw new Error('MESSAGE_NOT_FOUND')
+   484→
+   485→  await db.message.update({
+   486→    where: { id: messageId },
+   487→    data: { isDeleted: true, updatedAt: new Date() },
+   488→  })
+   489→
+   490→  await saveBackup(userId, 'delete', conversationId)
+   491→  return { ok: true }
+   492→}
+   493→
+   494→/**
+   495→ * Alterna para um ramo: muda o activeLeafId da conversa.
+   496→ * Não cria nem apaga nada. É só uma troca de visualização.
+   497→ *
+   498→ * Recebe o ID de qualquer nó da conversa. Se o nó tem filhos, descemos
+   499→ * pelo "filho preferido" (o último ativo, ou o último criado) até achar
+   500→ * a folha. Se não tem filhos, o próprio nó é a folha.
+   501→ *
+   502→ * Isso permite que o frontend clique num sibling do meio da thread
+   503→ * e o backend calcule qual é a folha correspondente àquele ramo.
+   504→ */
+   505→export async function switchBranch(userId: string, conversationId: string, nodeId: string) {
+   506→  const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
+   507→  if (!conv) throw new Error('CONVERSATION_NOT_FOUND')
+   508→
+   509→  const node = await db.message.findFirst({
+   510→    where: { id: nodeId, conversationId },
+   511→  })
+   512→  if (!node) throw new Error('MESSAGE_NOT_FOUND')
+   513→
+   514→  // Acha a folha: desce pela árvore pegando o último filho (ou o filho ativo, se houver)
+   515→  const allMessages = await db.message.findMany({ where: { conversationId } })
+   516→  const childrenByParent = new Map<string, typeof allMessages>()
+   517→  for (const m of allMessages) {
+   518→    if (!m.parentMessageId) continue
+   519→    if (!childrenByParent.has(m.parentMessageId)) childrenByParent.set(m.parentMessageId, [])
+   520→    childrenByParent.get(m.parentMessageId!)!.push(m)
+   521→  }
+   522→
+   523→  let leaf = node
+   524→  while (true) {
+   525→    const children = (childrenByParent.get(leaf.id) ?? [])
+   526→      .filter((c) => !c.isDeleted)
+   527→      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()) // último primeiro
+   528→    if (children.length === 0) break
+   529→    leaf = children[0]
+   530→  }
+   531→
+   532→  await db.conversation.update({
+   533→    where: { id: conversationId },
+   534→    data: { activeLeafId: leaf.id, lastActiveAt: new Date() },
+   535→  })
+   536→
+   537→  await saveBackup(userId, 'switch', conversationId)
+   538→  return { ok: true, activeLeafId: leaf.id }
+   539→}
+   540→
+   541→/**
+   542→ * Retorna a árvore completa da conversa — todas as mensagens com seus parentMessageId.
+   543→ * O frontend usa isso para renderizar a thread ativa + setas de versão.
+   544→ *
+   545→ * Inclui siblings de cada nó (irmãos com mesmo parentMessageId) para a UI
+   546→ * saber quantas "versões" existem naquela posição e qual é a ativa.
+   547→ */
+   548→export async function getConversationTree(conversationId: string, userId: string) {
+   549→  const conv = await db.conversation.findFirst({
+   550→    where: { id: conversationId, userId },
+   551→  })
+   552→  if (!conv) throw new Error('CONVERSATION_NOT_FOUND')
+   553→
+   554→  const messages = await db.message.findMany({
+   555→    where: { conversationId },
+   556→    orderBy: { createdAt: 'asc' },
+   557→  })
+   558→
+   559→  // Map id -> message
+   560→  const byId = new Map(messages.map((m) => [m.id, m]))
+   561→
+   562→  // Thread ativa: caminho da raiz até activeLeafId
+   563→  const activeThread: string[] = []
+   564→  let cur = conv.activeLeafId ? byId.get(conv.activeLeafId) : undefined
+   565→  while (cur) {
+   566→    activeThread.unshift(cur.id)
+   567→    cur = cur.parentMessageId ? byId.get(cur.parentMessageId) : undefined
+   568→  }
+   569→  const activeThreadSet = new Set(activeThread)
+   570→
+   571→  // Para cada mensagem, calcula siblings (mesmo parentMessageId) e qual é o índice do ativo
+   572→  // Agrupar por parentMessageId
+   573→  const siblingsByParent = new Map<string | null, typeof messages>()
+   574→  for (const m of messages) {
+   575→    const key = m.parentMessageId ?? null
+   576→    if (!siblingsByParent.has(key)) siblingsByParent.set(key, [])
+   577→    siblingsByParent.get(key)!.push(m)
+   578→  }
+   579→
+   580→  // Para cada nó, retorna info útil para a UI
+   581→  const nodes = messages.map((m) => {
+   582→    const siblings = siblingsByParent.get(m.parentMessageId ?? null) ?? []
+   583→    // Quantos irmãos (incluindo ele mesmo) — quantas "versões" existem nesta posição
+   584→    const siblingCount = siblings.length
+   585→    // Qual o índice deste nó entre os irmãos (1-indexed, por createdAt)
+   586→    const sortedSiblings = [...siblings].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+   587→    const indexAmongSiblings = sortedSiblings.findIndex((s) => s.id === m.id) + 1
+   588→    // Este nó é o "ativo" nesta posição? (está na thread ativa)
+   589→    const isActive = activeThreadSet.has(m.id)
+   590→    return {
+   591→      id: m.id,
+   592→      role: m.role,
+   593→      content: m.content,
+   594→      parentMessageId: m.parentMessageId,
+   595→      isDeleted: m.isDeleted,
+   596→      createdAt: m.createdAt,
+   597→      generation: m.generation,
+   598→      siblings: sortedSiblings.map((s) => ({
+   599→        id: s.id,
+   600→        content: s.content,
+   601→        createdAt: s.createdAt,
+   602→        isActive: activeThreadSet.has(s.id),
+   603→        isDeleted: s.isDeleted,
+   604→      })),
+   605→      siblingCount,
+   606→      indexAmongSiblings,
+   607→      isActive,
+   608→    }
+   609→  })
+   610→
+   611→  // Retorna só a thread ativa (em ordem), mas cada nó traz info sobre siblings
+   612→  const threadNodes = activeThread
+   613→    .map((id) => nodes.find((n) => n.id === id))
+   614→    .filter(Boolean) as typeof nodes
+   615→
+   616→  return {
+   617→    conversationId,
+   618→    activeLeafId: conv.activeLeafId,
+   619→    thread: threadNodes,
+   620→    allNodes: nodes,
+   621→  }
+   622→}
+   623→
+   624→/**
+   625→ * Regenera a resposta da IA a uma mensagem do usuário.
+   626→ * Cria um novo nó assistant IRMÃO do assistant atual (mesmo pai = a mensagem do usuário).
+   627→ * Não apaga o assistant anterior — ele fica como ramo alternativo.
+   628→ *
+   629→ * Use case: o usuário mandou msg, IA respondeu, mas ele não gostou. Clica em "Regenerar"
+   630→ * e a IA cria uma nova resposta no mesmo ponto. Pode alternar entre as respostas com as setas.
+   631→ */
+   632→export async function regenerateAssistantMessage(
+   633→  userId: string,
+   634→  conversationId: string,
+   635→  assistantMessageId: string
+   636→) {
+   637→  const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
+   638→  if (!conv) throw new Error('CONVERSATION_NOT_FOUND')
+   639→
+   640→  const oldAssistant = await db.message.findFirst({
+   641→    where: { id: assistantMessageId, conversationId, role: 'assistant' },
+   642→  })
+   643→  if (!oldAssistant) throw new Error('MESSAGE_NOT_FOUND')
+   644→  if (!oldAssistant.parentMessageId) throw new Error('ASSISTANT_HAS_NO_PARENT')
+   645→
+   646→  const parentId = oldAssistant.parentMessageId // é a mensagem do usuário
+   647→
+   648→  // Temporariamente seta o activeLeafId para o pai (a msg do usuário)
+   649→  // para que buildHistoryForAI inclua só até o pai, sem o assistant antigo
+   650→  await db.conversation.update({
+   651→    where: { id: conversationId },
+   652→    data: { activeLeafId: parentId },
+   653→  })
+   654→
+   655→  // Gera nova resposta
+   656→  const history = await buildHistoryForAI(conversationId)
+   657→  let newContent: string
+   658→  try {
+   659→    newContent = await generateAssistantReply(history)
+   660→  } catch (err) {
+   661→    // Restaura o activeLeafId anterior em caso de erro
+   662→    await db.conversation.update({
+   663→      where: { id: conversationId },
+   664→      data: { activeLeafId: oldAssistant.id },
+   665→    })
+   666→    throw new Error(`Erro ao regenerar: ${(err as Error).message}`)
+   667→  }
+   668→
+   669→  // Cria novo nó assistant irmão do antigo
+   670→  const newAssistant = await db.message.create({
+   671→    data: {
+   672→      conversationId,
+   673→      role: 'assistant',
+   674→      content: newContent,
+   675→      parentMessageId: parentId,
+   676→      generation: 'regen',
+   677→    },
+   678→  })
+   679→
+   680→  // Atualiza activeLeafId para o novo assistant
+   681→  await db.conversation.update({
+   682→    where: { id: conversationId },
+   683→    data: { activeLeafId: newAssistant.id, lastActiveAt: new Date() },
+   684→  })
+   685→
+   686→  await saveBackup(userId, 'regenerate', conversationId)
+   687→
+   688→  return {
+   689→    newAssistantMessage: { id: newAssistant.id, content: newContent },
+   690→  }
+   691→}
+   692→
+   693→export async function renameConversation(userId: string, conversationId: string, newTitle: string) {
+   694→  const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
+   695→  if (!conv) throw new Error('CONVERSATION_NOT_FOUND')
+   696→  const updated = await db.conversation.update({
+   697→    where: { id: conversationId },
+   698→    data: { title: newTitle.trim() || conv.title, updatedAt: new Date() },
+   699→  })
+   700→  await saveBackup(userId, 'rename', conversationId)
+   701→  return updated
+   702→}
+   703→
+   704→export async function deleteConversation(userId: string, conversationId: string) {
+   705→  const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
+   706→  if (!conv) throw new Error('CONVERSATION_NOT_FOUND')
+   707→  await saveBackup(userId, 'delete-conversation', conversationId)
+   708→  await db.conversation.delete({ where: { id: conversationId } })
+   709→  return { ok: true }
+   710→}
+   711→

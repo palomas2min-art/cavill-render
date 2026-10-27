@@ -180,22 +180,23 @@ TAMANHO DE RESPOSTA (muito importante — responde na medida do que foi pedido):
 - Mensagem curta do usuário ("oi", "tudo bem?", "vc lembra de X?") = resposta curta (1-3 frases, 50-300 caracteres).
 - Pergunta direta = resposta direta (200-800 caracteres).
 - "Continua" ou "continue" = cena de tamanho médio (800-1500 caracteres).
-- "Escreve um capítulo", "capítulo longo", "quero detalhado", "me dá uma cena completa" = CAPÍTULO (1000-1500 caracteres).
+- "Escreve um capítulo", "capítulo longo", "quero detalhado", "me dá uma cena completa" = CAPÍTULO (1500-2500 caracteres).
 - "Detalha mais", "quero mais", "pode estender" = estende a cena anterior.
 - NUNCA escreva menos de 50 caracteres (resposta demais = robótica).
-- NUNCA escreva mais de 1500 caracteres por resposta (limite técnico — quando chegar perto, FINALIZE a cena naturalmente).
+- NUNCA escreva mais de 2500 caracteres por resposta (limite técnico — quando chegar perto, FINALIZE a cena naturalmente).
 - Cortar é melhor que encher linguiça. Se a cena acabou, para. Não estica à toa.
 - Se o usuário mandar "oi", NÃO escreve capítulo. Responde "Oi, tudo bem?" e pronto.
 - Se o usuário quiser continuar a cena, ele manda "continua" — você escreve a próxima parte.
 
 FINALIZAÇÃO NATURAL (CRÍTICO — nunca corte no meio):
-- Você tem um LIMITE de ~1500 caracteres por resposta. Planeje sua cena pra TERMINAR dentro desse limite.
-- NUNCA comece uma cena longa sabendo que vai cortar no meio. Se a cena é grande demais, escreve uma PARTE completa (com começo, meio e fim dentro do limite) e deixa o usuário pedir "continua".
-- Quando chegar perto do limite (1300+ caracteres), FINALIZE a cena: fecha o diálogo, conclui o pensamento, dá um fechamento satisfatório. NÃO deixe frase incompleta.
-- Se a cena tá começando e você percebe que não vai caber, REDUZA o escopo: menos personagens, menos detalhes, foco em um momento só.
+- Você tem um LIMITE RÍGIDO de 2500 caracteres por resposta. Se passar disso, o sistema CORTA no meio — fica feio e frustrante.
+- PLANEJE sua cena ANTES de começar a escrever. Saiba onde vai terminar.
+- Quando chegar em ~2000 caracteres, COMECE A FINALIZAR: fecha diálogo, conclui pensamento, dá fechamento satisfatório.
+- NUNCA comece uma cena longa sabendo que vai cortar. Se a cena é grande demais, escreve uma PARTE completa (com começo, meio e fim) e deixa o usuário pedir "continua".
+- NUNCA termine uma frase incompleta. Se a frase não vai caber, NÃO começa.
+- Se você perceber que vai cortar, PARE antes — finalize com uma frase de fechamento tipo: "Ela respirou fundo, esperando o que viria a seguir."
 - É MELHOR uma cena curta e completa que uma cena longa cortada no meio.
-- O NUNCA corte uma frase no meio. Se a frase não vai caber, não começa.
-- Se você perceber que vai cortar, PARE antes — finalize com uma frase de fechamento ("Ela respirou fundo, esperando o que viria a seguir." ou similar).
+- Quando o usuário pedir cena, PERGUNTE "quer cena curta (~1000 chars) ou longa (~2500 chars)?" se não ficou claro.
 
 FORMATO (leitura confortável):
 - Parágrafos curtos: 2 a 4 frases cada. NUNCA um bloco único de texto longo.
@@ -286,7 +287,7 @@ ANTI-REPETIÇÃO (CRÍTICO — NUNCA repeta):
 - Se a cena está em loop (personagem fazendo a mesma coisa repetidas vezes), PARE. Mude a ação. Avance.
 - Cada parágrafo DEVE avançar a história. Se o parágrafo repete o anterior, corte-o.
 - Variação é obrigatória: se usou uma estrutura ("O corpo dela. O corpo que ela não olha."), NÃO use de novo.
-- Máximo de 1500 caracteres por resposta. Quando terminar a cena, PARE naturalmente. Não continue repetindo pra encher.
+- Máximo de 2500 caracteres por resposta. Quando terminar a cena, PARE naturalmente. Não continue repetindo pra encher.
 
 SEM ENROLAÇÃO:
 - Capítulos longos mas densos. Cada palavra pesa. O leitor vive, não lê.
@@ -404,7 +405,7 @@ export async function generateAssistantReply(history: ChatTurn[]): Promise<strin
           top_p: 0.92,
           frequency_penalty: 0.7,
           presence_penalty: 0.8,
-          max_tokens: 1500,
+          max_tokens: 2500,
           repetition_penalty: 1.15,
         })
 
